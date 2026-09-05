@@ -1,9 +1,8 @@
-import Favorite from "../models/Favorite.js";
+import Favorite from "../models/favorite.js";
 import Product from "../models/product.js";
 
 import responseHandler from "../libs/responseHandler.js";
 import tryCatchFn from "../libs/tryCatchFn.js";
-
 
 // =====================================================
 // ADD TO FAVORITES
@@ -14,19 +13,14 @@ export const addFavorite = tryCatchFn(async (req, res) => {
   const { productId } = req.body;
 
   if (!productId) {
-    throw responseHandler.errorResponse(
-      "Product ID is required",
-      400
-    );
+    throw responseHandler.errorResponse("Product ID is required", 400);
   }
 
   // Check product exists
   const product = await Product.findById(productId);
 
   if (!product) {
-    throw responseHandler.notFoundResponse(
-      "Product not found"
-    );
+    throw responseHandler.notFoundResponse("Product not found");
   }
 
   // Check if already favorited
@@ -42,7 +36,7 @@ export const addFavorite = tryCatchFn(async (req, res) => {
         favorite: true,
         productId,
       },
-      "Product is already in your favorites"
+      "Product is already in your favorites",
     );
   }
 
@@ -59,10 +53,9 @@ export const addFavorite = tryCatchFn(async (req, res) => {
       favoriteId: favorite._id,
     },
     "Product added to favorites",
-    201
+    201,
   );
 });
-
 
 // =====================================================
 // REMOVE FROM FAVORITES
@@ -73,10 +66,7 @@ export const removeFavorite = tryCatchFn(async (req, res) => {
   const { productId } = req.params;
 
   if (!productId) {
-    throw responseHandler.errorResponse(
-      "Product ID is required",
-      400
-    );
+    throw responseHandler.errorResponse("Product ID is required", 400);
   }
 
   const favorite = await Favorite.findOneAndDelete({
@@ -85,9 +75,7 @@ export const removeFavorite = tryCatchFn(async (req, res) => {
   });
 
   if (!favorite) {
-    throw responseHandler.notFoundResponse(
-      "Product is not in your favorites"
-    );
+    throw responseHandler.notFoundResponse("Product is not in your favorites");
   }
 
   return responseHandler.successResponse(
@@ -96,10 +84,9 @@ export const removeFavorite = tryCatchFn(async (req, res) => {
       favorite: false,
       productId,
     },
-    "Product removed from favorites"
+    "Product removed from favorites",
   );
 });
-
 
 // =====================================================
 // TOGGLE FAVORITE
@@ -110,19 +97,14 @@ export const toggleFavorite = tryCatchFn(async (req, res) => {
   const { productId } = req.body;
 
   if (!productId) {
-    throw responseHandler.errorResponse(
-      "Product ID is required",
-      400
-    );
+    throw responseHandler.errorResponse("Product ID is required", 400);
   }
 
   // Check product exists
   const product = await Product.findById(productId);
 
   if (!product) {
-    throw responseHandler.notFoundResponse(
-      "Product not found"
-    );
+    throw responseHandler.notFoundResponse("Product not found");
   }
 
   // Check current favorite
@@ -143,7 +125,7 @@ export const toggleFavorite = tryCatchFn(async (req, res) => {
         favorite: false,
         productId,
       },
-      "Product removed from favorites"
+      "Product removed from favorites",
     );
   }
 
@@ -161,10 +143,9 @@ export const toggleFavorite = tryCatchFn(async (req, res) => {
       favoriteId: favorite._id,
     },
     "Product added to favorites",
-    201
+    201,
   );
 });
-
 
 // =====================================================
 // GET MY FAVORITES
@@ -189,10 +170,9 @@ export const getMyFavorites = tryCatchFn(async (req, res) => {
       favorites,
       count: favorites.length,
     },
-    "Favorites retrieved successfully"
+    "Favorites retrieved successfully",
   );
 });
-
 
 // =====================================================
 // CHECK IF PRODUCT IS FAVORITE
@@ -213,6 +193,6 @@ export const checkFavorite = tryCatchFn(async (req, res) => {
       favorite: !!favorite,
       productId,
     },
-    "Favorite status retrieved"
+    "Favorite status retrieved",
   );
 });
