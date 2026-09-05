@@ -458,7 +458,7 @@ export const googleAuth = tryCatchFn(async (req, res) => {
         profileImage: user.profileImage || null,
       },
     },
-    "Google authentication successful",
+    "Google authentication successful..",
     200,
   );
 });
