@@ -1,93 +1,167 @@
-import Template from "../models/Template.js";
 import User from "../models/user.js";
-import Notification from "../models/Notification.js";
-import Contact from "../models/contact.js";
+import Notification from "../models/notification.model.js";
 
 import emitDashboardUpdate from "../utils/emitDashboardUpdate.js";
 import { sendEmail, sendSMS } from "../utils/notify.js";
-
 import responseHandler from "../libs/responseHandler.js";
 import tryCatchFn from "../libs/tryCatchFn.js";
 
 // ============================================================
-// GET ALL USER NOTIFICATIONS
+// GET USER NOTIFICATIONS
 // GET /api/notifications
 // ============================================================
 
 export const getNotifications = tryCatchFn(async (req, res) => {
   const { category, unread } = req.query;
 
-  if (!req.user?._id && !req.user?.id) {
+  const userId = req.user?._id || req.user?.id;
+
+  if (!userId) {
     throw responseHandler.unauthorizedResponse("Authentication required");
   }
 
-  const userId = req.user._id || req.user.id;
+  // ========================================
+  // PERSONAL NOTIFICATIONS
+  // ========================================
 
-  const filter = {
+  const personalFilter = {
     user: userId,
   };
 
   if (category) {
-    filter.category = category;
+    personalFilter.category = category;
   }
 
   if (unread === "true") {
-    filter.read = false;
+    personalFilter.read = false;
   }
 
-  const notifications = await Notification.find(filter).sort({
-    createdAt: -1,
-  });
+  const personalNotifications = await Notification.find(personalFilter)
+    .sort({ createdAt: -1 })
+    .lean();
 
-  const unreadCount = await Notification.countDocuments({
-    user: userId,
-    read: false,
-  });
+  // ========================================
+  // BROADCAST NOTIFICATIONS
+  // ========================================
 
-  const all = await Notification.countDocuments({
-    user: userId,
-  });
+  const broadcastFilter = {
+    isBroadcast: true,
+  };
 
-  const security = await Notification.countDocuments({
-    user: userId,
-    category: "security",
-  });
+  if (category) {
+    broadcastFilter.category = category;
+  }
 
-  const transaction = await Notification.countDocuments({
-    user: userId,
-    category: "transaction",
-  });
+  const broadcasts = await Notification.find(broadcastFilter)
+    .sort({ createdAt: -1 })
+    .lean();
 
-  const system = await Notification.countDocuments({
-    user: userId,
-    category: "system",
-  });
+  // ========================================
+  // FILTER BROADCASTS USER HAS READ
+  // ========================================
+
+  const unreadBroadcasts = broadcasts.filter(
+    (notification) =>
+      !notification.readBy?.some((id) => id.toString() === userId.toString()),
+  );
+
+  const broadcastNotifications =
+    unread === "true" ? unreadBroadcasts : broadcasts;
+
+  // ========================================
+  // MERGE
+  // ========================================
+
+  const notifications = [
+    ...personalNotifications,
+    ...broadcastNotifications,
+  ].sort((a, b) => new Date(b.createdAt) - new Date(a.createdAt));
+
+  // ========================================
+  // COUNTS
+  // ========================================
+
+  const [
+    personalUnread,
+    broadcastUnread,
+    allPersonal,
+    security,
+    transaction,
+    orders,
+    system,
+  ] = await Promise.all([
+    Notification.countDocuments({
+      user: userId,
+      read: false,
+    }),
+
+    Notification.countDocuments({
+      isBroadcast: true,
+      readBy: {
+        $ne: userId,
+      },
+    }),
+
+    Notification.countDocuments({
+      user: userId,
+    }),
+
+    Notification.countDocuments({
+      user: userId,
+      category: "security",
+    }),
+
+    Notification.countDocuments({
+      user: userId,
+      category: "transaction",
+    }),
+
+    Notification.countDocuments({
+      user: userId,
+      category: "orders",
+    }),
+
+    Notification.countDocuments({
+      user: userId,
+      category: "system",
+    }),
+  ]);
 
   return res.status(200).json({
     success: true,
-    unreadCount,
+
+    unreadCount: personalUnread + broadcastUnread,
+
     notifications,
+
     counts: {
-      all,
+      all: allPersonal + broadcasts.length,
+
+      unread: personalUnread + broadcastUnread,
+
       security,
+
       transaction,
+
+      orders,
+
       system,
     },
   });
 });
 
 // ============================================================
-// CREATE NEW NOTIFICATION
-// This is a reusable service function, NOT an Express handler.
-// ============================================================
+// CREATE PERSONAL NOTIFICATION
 
 export const createNotification = async ({
   userId,
   title,
   message,
-  category,
-  email,
-  phone,
+  category = "system",
+  type = "system",
+  email = null,
+  phone = null,
+  channels = ["InApp"],
   metadata = null,
 }) => {
   try {
@@ -97,45 +171,88 @@ export const createNotification = async ({
 
     const notification = await Notification.create({
       user: userId,
+
+      specificUserId: userId,
+
+      isBroadcast: false,
+
       title,
+
       message,
+
       category,
+
+      type,
+
+      channels,
+
       read: false,
+
+      status: "Pending",
+
+      sentToCount: 1,
+
+      deliveryTime: new Date(),
+
       metadata,
     });
 
     // ========================================
-    // REAL-TIME UPDATE
+    // REAL-TIME
     // ========================================
 
     const io = global.io || null;
 
     if (io) {
-      io.to(userId.toString()).emit("new-notification", notification);
+      io.to(`user:${userId.toString()}`).emit("new-notification", notification);
+
+      await emitDashboardUpdate(io, userId);
     }
 
     // ========================================
-    // OPTIONAL EMAIL
+    // EMAIL
     // ========================================
 
-    if (email) {
-      await sendEmail({
-        to: email,
-        subject: title,
-        html: `<p>${message}</p>`,
-      });
+    if (channels.includes("Email") && email) {
+      try {
+        await sendEmail({
+          to: email,
+          subject: title,
+          html: `
+            <div style="font-family: Arial, sans-serif;">
+              <h2>${title}</h2>
+              <p>${message}</p>
+              <p>Thank you for using WAGBA.</p>
+            </div>
+          `,
+        });
+      } catch (error) {
+        console.error("Notification email error:", error.message);
+      }
     }
 
     // ========================================
-    // OPTIONAL SMS
+    // SMS
     // ========================================
 
-    if (phone) {
-      await sendSMS({
-        to: phone,
-        message,
-      });
+    if (channels.includes("SMS") && phone) {
+      try {
+        await sendSMS({
+          to: phone,
+          message,
+        });
+      } catch (error) {
+        console.error("Notification SMS error:", error.message);
+      }
     }
+
+    // ========================================
+    // UPDATE STATUS
+    // ========================================
+
+    notification.status = "Delivered";
+
+    await notification.save();
 
     return notification;
   } catch (error) {
@@ -146,7 +263,7 @@ export const createNotification = async ({
 };
 
 // ============================================================
-// MARK SINGLE USER NOTIFICATION AS READ
+// MARK SINGLE NOTIFICATION AS READ
 // PATCH /api/notifications/:id/read
 // ============================================================
 
@@ -163,31 +280,62 @@ export const markAsRead = tryCatchFn(async (req, res) => {
     throw responseHandler.badRequestResponse("Notification ID is required");
   }
 
-  const notification = await Notification.findOneAndUpdate(
+  // ========================================
+  // PERSONAL NOTIFICATION
+  // ========================================
+
+  let notification = await Notification.findOneAndUpdate(
     {
       _id: id,
       user: userId,
     },
     {
-      read: true,
+      $set: {
+        read: true,
+      },
     },
     {
       new: true,
     },
   );
 
+  // ========================================
+  // BROADCAST NOTIFICATION
+  // ========================================
+
+  if (!notification) {
+    notification = await Notification.findOneAndUpdate(
+      {
+        _id: id,
+        isBroadcast: true,
+      },
+      {
+        $addToSet: {
+          readBy: userId,
+        },
+      },
+      {
+        new: true,
+      },
+    );
+  }
+
   if (!notification) {
     throw responseHandler.notFoundResponse("Notification not found");
   }
 
-  const io = req.app.get("io");
+  // ========================================
+  // REAL-TIME
+  // ========================================
+
+  const io = req.app.get("io") || global.io || null;
 
   if (io) {
-    await emitDashboardUpdate(io, userId);
-
-    io.to(userId.toString()).emit("notification-read", {
+    io.to(`user:${userId.toString()}`).emit("notification-read", {
       notificationId: id,
     });
+
+    await emitDashboardUpdate(io, userId);
   }
 
   return res.status(200).json({
@@ -198,7 +346,7 @@ export const markAsRead = tryCatchFn(async (req, res) => {
 });
 
 // ============================================================
-// MARK ALL USER NOTIFICATIONS AS READ
+// MARK ALL AS READ
 // PATCH /api/notifications/read-all
 // ============================================================
 
@@ -209,6 +357,7 @@ export const markAllAsRead = tryCatchFn(async (req, res) => {
     throw responseHandler.unauthorizedResponse("Authentication required");
   }
 
+  // Personal
   await Notification.updateMany(
     {
       user: userId,
@@ -221,12 +370,27 @@ export const markAllAsRead = tryCatchFn(async (req, res) => {
     },
   );
 
-  const io = req.app.get("io");
+  // Broadcast
+  await Notification.updateMany(
+    {
+      isBroadcast: true,
+      readBy: {
+        $ne: userId,
+      },
+    },
+    {
+      $addToSet: {
+        readBy: userId,
+      },
+    },
+  );
+
+  const io = req.app.get("io") || global.io || null;
 
   if (io) {
-    await emitDashboardUpdate(io, userId);
+    io.to(`user:${userId.toString()}`).emit("notifications-cleared");
 
-    io.to(userId.toString()).emit("notifications-cleared");
+    await emitDashboardUpdate(io, userId);
   }
 
   return res.status(200).json({
@@ -236,7 +400,7 @@ export const markAllAsRead = tryCatchFn(async (req, res) => {
 });
 
 // ============================================================
-// ADMIN - SEND NOTIFICATION
+// ADMIN SEND NOTIFICATION
 // POST /api/admin/notifications
 // ============================================================
 
@@ -244,20 +408,26 @@ export const sendNotification = tryCatchFn(async (req, res) => {
   const {
     title,
     message,
-    templateId,
-    channels = [],
+    channels = ["InApp"],
     audience = "all",
     userId,
-    schedule = "immediate",
-    scheduledTime,
+    category = "system",
+    type = "system",
+    metadata = null,
   } = req.body;
 
   // ========================================
   // VALIDATION
   // ========================================
 
-  if (!title && !templateId) {
-    throw responseHandler.badRequestResponse("Title or template is required");
+  if (!title?.trim()) {
+    throw responseHandler.badRequestResponse("Notification title is required");
+  }
+
+  if (!message?.trim()) {
+    throw responseHandler.badRequestResponse(
+      "Notification message is required",
+    );
   }
 
   // ========================================
@@ -266,13 +436,21 @@ export const sendNotification = tryCatchFn(async (req, res) => {
 
   const formattedChannels = Array.isArray(channels)
     ? channels.map((channel) => {
-        if (channel === "email") return "Email";
-        if (channel === "sms") return "SMS";
-        if (channel === "inApp") return "InApp";
+        if (channel.toLowerCase() === "email") {
+          return "Email";
+        }
+
+        if (channel.toLowerCase() === "sms") {
+          return "SMS";
+        }
+
+        if (channel.toLowerCase() === "inapp") {
+          return "InApp";
+        }
 
         return channel;
       })
-    : [];
+    : ["InApp"];
 
   // ========================================
   // AUDIENCE MAP
@@ -285,33 +463,17 @@ export const sendNotification = tryCatchFn(async (req, res) => {
     specific: "Specific User",
   };
 
-  const target = audienceMap[audience] || "All Users";
+  const target = audienceMap[audience];
 
-  // ========================================
-  // FETCH TEMPLATE
-  // ========================================
-
-  let template = null;
-
-  if (templateId) {
-    template = await Template.findById(templateId);
-
-    if (!template) {
-      throw responseHandler.notFoundResponse("Template not found");
-    }
+  if (!target) {
+    throw responseHandler.badRequestResponse("Invalid notification audience");
   }
 
-  const finalTitle = template?.subject || title;
-
-  const finalMessageContent = template?.content || message;
-
   // ========================================
-  // FIND SPECIFIC USER
+  // FIND USERS
   // ========================================
 
-  let user = null;
-  let userEmail = null;
-  let userPhone = null;
+  let userQuery = {};
 
   if (audience === "specific") {
     if (!userId) {
@@ -320,161 +482,288 @@ export const sendNotification = tryCatchFn(async (req, res) => {
       );
     }
 
-    user = await User.findById(userId);
+    userQuery = {
+      _id: userId,
+    };
+  }
+
+  if (audience === "verified") {
+    userQuery = {
+      $or: [
+        {
+          isVerified: true,
+        },
+        {
+          verified: true,
+        },
+        {
+          emailVerified: true,
+        },
+      ],
+    };
+  }
+
+  if (audience === "inactive") {
+    userQuery = {
+      $or: [
+        {
+          isActive: false,
+        },
+        {
+          status: "inactive",
+        },
+      ],
+    };
+  }
+
+  // ========================================
+  // SPECIFIC USER
+  // ========================================
+
+  if (audience === "specific") {
+    const user = await User.findById(userId).select(
+      "_id email phone fullName firstName lastName",
+    );
 
     if (!user) {
       throw responseHandler.notFoundResponse("User not found");
     }
 
-    userEmail = user.email || null;
-    userPhone = user.phone || null;
+    const notification = await Notification.create({
+      user: user._id,
+
+      specificUserId: user._id,
+
+      isBroadcast: false,
+
+      title: title.trim(),
+
+      message: message.trim(),
+
+      category,
+
+      type,
+
+      target,
+
+      channels: formattedChannels,
+
+      status: "Pending",
+
+      sentToCount: 1,
+
+      deliveryTime: new Date(),
+
+      createdBy: req.user?._id || null,
+
+      createdByType: req.user?.role || "admin",
+
+      metadata,
+    });
+
+    await deliverNotification(notification, user, formattedChannels);
+
+    return res.status(201).json({
+      success: true,
+      message: "Notification sent successfully",
+      notification,
+    });
   }
 
   // ========================================
-  // USER FULL NAME
+  // ALL / VERIFIED / INACTIVE
   // ========================================
 
-  const fullName = user
-    ? [user.firstName, user.lastName].filter(Boolean).join(" ")
-    : "Valued Customer";
+  const users = await User.find(userQuery).select(
+    "_id email phone fullName firstName lastName",
+  );
+
+  if (!users.length) {
+    throw responseHandler.notFoundResponse("No users found for this audience");
+  }
 
   // ========================================
-  // EMAIL HTML
-  // ========================================
-
-  const emailHtml = `
-      <div style="font-family: Arial, sans-serif;">
-        <h2>${finalTitle}</h2>
-
-        <p>
-          Hello ${fullName},
-        </p>
-
-        <p>
-          ${finalMessageContent}
-        </p>
-
-        <p>
-          Thank you,
-          <br />
-          WAGBA
-        </p>
-      </div>
-    `;
-
-  // ========================================
-  // SAVE NOTIFICATION
+  // CREATE BROADCAST
   // ========================================
 
   const notification = await Notification.create({
-    title: finalTitle,
-    message: finalMessageContent,
+    user: null,
 
-    channels: formattedChannels,
+    specificUserId: null,
+
+    isBroadcast: true,
+
+    title: title.trim(),
+
+    message: message.trim(),
+
+    category,
+
+    type,
 
     target,
 
-    specificUserId: audience === "specific" ? userId : null,
+    channels: formattedChannels,
 
-    status: "Delivered",
+    status: "Pending",
 
-    sentToCount: audience === "specific" ? 1 : 0,
+    sentToCount: users.length,
 
-    deliveryTime:
-      schedule === "scheduled" ? new Date(scheduledTime) : new Date(),
+    deliveryTime: new Date(),
 
     createdBy: req.user?._id || null,
 
-    createdByType: req.user?.role || "system",
+    createdByType: req.user?.role || "admin",
+
+    metadata,
   });
 
   // ========================================
-  // SEND EMAIL
+  // DELIVER
   // ========================================
 
-  if (formattedChannels.includes("Email") && userEmail) {
-    try {
-      await sendEmail({
-        to: userEmail,
-        subject: finalTitle,
-        html: emailHtml,
-      });
-
-      console.log(`✅ Notification email sent to ${userEmail}`);
-    } catch (emailError) {
-      console.error("❌ Email send error:", emailError);
-    }
+  for (const user of users) {
+    await deliverNotification(notification, user, formattedChannels);
   }
 
-  // ========================================
-  // SEND SMS
-  // ========================================
+  notification.status = "Delivered";
 
-  if (formattedChannels.includes("SMS") && userPhone) {
-    try {
-      await sendSMS({
-        to: userPhone,
-        message: finalMessageContent,
-      });
-
-      console.log(`✅ Notification SMS sent to ${userPhone}`);
-    } catch (smsError) {
-      console.error("❌ SMS send error:", smsError);
-    }
-  }
+  await notification.save();
 
   // ========================================
-  // REAL-TIME IN-APP NOTIFICATION
+  // SOCKET BROADCAST
   // ========================================
 
-  if (
-    formattedChannels.includes("InApp") &&
-    audience === "specific" &&
-    userId
-  ) {
-    const io = req.app.get("io") || global.io || null;
+  const io = req.app.get("io") || global.io || null;
 
-    if (io) {
-      io.to(userId.toString()).emit("new-notification", notification);
-    }
+  if (io) {
+    io.emit("new-broadcast-notification", notification);
   }
 
   return res.status(201).json({
     success: true,
+
     message: "Notification sent successfully",
+
     notification,
+
+    sentToCount: users.length,
   });
 });
 
 // ============================================================
-// ADMIN - GET ALL NOTIFICATIONS
+// DELIVER NOTIFICATION
+// ============================================================
+
+const deliverNotification = async (notification, user, channels) => {
+  // ========================================
+  // EMAIL
+  // ========================================
+
+  if (channels.includes("Email") && user.email) {
+    try {
+      const fullName =
+        user.fullName ||
+        [user.firstName, user.lastName].filter(Boolean).join(" ") ||
+        "Valued Customer";
+
+      await sendEmail({
+        to: user.email,
+
+        subject: notification.title,
+
+        html: `
+          <div style="
+            font-family: Arial, sans-serif;
+            max-width: 600px;
+            margin: auto;
+            padding: 20px;
+          ">
+            <h2>
+              ${notification.title}
+            </h2>
+
+            <p>
+              Hello ${fullName},
+            </p>
+
+            <p>
+              ${notification.message}
+            </p>
+
+            <p>
+              Thank you for using WAGBA.
+            </p>
+          </div>
+        `,
+      });
+    } catch (error) {
+      console.error("Email notification failed:", error.message);
+    }
+  }
+
+  // ========================================
+  // SMS
+  // ========================================
+
+  if (channels.includes("SMS") && user.phone) {
+    try {
+      await sendSMS({
+        to: user.phone,
+
+        message: notification.message,
+      });
+    } catch (error) {
+      console.error("SMS notification failed:", error.message);
+    }
+  }
+
+  // ========================================
+  // IN-APP
+  // ========================================
+
+  if (channels.includes("InApp") && user._id) {
+    const io = global.io || null;
+
+    if (io) {
+      io.to(`user:${user._id.toString()}`).emit(
+        "new-notification",
+        notification,
+      );
+    }
+  }
+};
+
+// ============================================================
+// ADMIN GET ALL NOTIFICATIONS
 // GET /api/admin/notifications
 // ============================================================
 
 export const adminGetAllNotifications = tryCatchFn(async (req, res) => {
   let {
     page = 1,
-    limit = 4,
+    limit = 10,
     search = "",
     status,
     channel,
     target,
     type,
+    category,
     sort = "newest",
   } = req.query;
 
   page = Math.max(Number(page) || 1, 1);
 
-  limit = Math.min(Math.max(Number(limit) || 4, 1), 100);
+  limit = Math.min(Math.max(Number(limit) || 10, 1), 100);
+
+  const query = {};
 
   // ========================================
-  // NOTIFICATION QUERY
+  // SEARCH
   // ========================================
-
-  const notificationQuery = {};
 
   if (search) {
-    notificationQuery.$or = [
+    query.$or = [
       {
         title: {
           $regex: search,
@@ -490,187 +779,60 @@ export const adminGetAllNotifications = tryCatchFn(async (req, res) => {
     ];
   }
 
-  if (status && status !== "All Activities" && status !== "Received") {
-    notificationQuery.status = status;
+  // ========================================
+  // FILTERS
+  // ========================================
+
+  if (status && status !== "All") {
+    query.status = status;
   }
 
-  if (channel && channel !== "All Channels" && channel !== "Contact Form") {
-    notificationQuery.channels = channel;
+  if (channel && channel !== "All Channels") {
+    query.channels = channel;
   }
 
-  if (type && type !== "All" && type !== "support") {
-    notificationQuery.type = type;
+  if (target && target !== "All") {
+    query.target = target;
   }
 
-  if (target) {
-    notificationQuery.target = target;
+  if (type && type !== "All") {
+    query.type = type;
   }
 
-  const notifications = await Notification.find(notificationQuery)
-    .populate("createdBy", "firstName lastName name email role")
-    .populate("specificUserId", "firstName lastName email")
+  if (category && category !== "All") {
+    query.category = category;
+  }
+
+  // ========================================
+  // TOTAL
+  // ========================================
+
+  const total = await Notification.countDocuments(query);
+
+  // ========================================
+  // SORT
+  // ========================================
+
+  const sortOption = sort === "oldest" ? { createdAt: 1 } : { createdAt: -1 };
+
+  // ========================================
+  // FETCH
+  // ========================================
+
+  const notifications = await Notification.find(query)
+    .populate("createdBy", "fullName firstName lastName email role")
+    .populate("specificUserId", "fullName firstName lastName email phone")
+    .sort(sortOption)
+    .skip((page - 1) * limit)
+    .limit(limit)
     .lean();
 
-  // ========================================
-  // CONTACT QUERY
-  // ========================================
-
-  const contactQuery = {};
-
-  if (search) {
-    contactQuery.$or = [
-      {
-        subject: {
-          $regex: search,
-          $options: "i",
-        },
-      },
-      {
-        message: {
-          $regex: search,
-          $options: "i",
-        },
-      },
-      {
-        fullName: {
-          $regex: search,
-          $options: "i",
-        },
-      },
-      {
-        email: {
-          $regex: search,
-          $options: "i",
-        },
-      },
-    ];
-  }
-
-  let contacts = [];
-
-  if (!type || type === "All" || type === "support") {
-    contacts = await Contact.find(contactQuery).lean();
-
-    if (channel && channel !== "All Channels" && channel !== "Contact Form") {
-      contacts = [];
-    }
-
-    if (status && status !== "All Activities" && status !== "Received") {
-      contacts = [];
-    }
-  }
-
-  // ========================================
-  // NORMALIZE NOTIFICATIONS
-  // ========================================
-
-  const notificationData = notifications.map((item) => ({
-    id: item._id,
-
-    recordType: "notification",
-
-    type: item.type,
-
-    title: item.title || null,
-
-    subject: null,
-
-    titleOrSubject: item.title,
-
-    message: item.message,
-
-    channels: item.channels || [],
-
-    target: item.target,
-
-    sentCount: item.sentToCount || 0,
-
-    createdAt: item.createdAt,
-
-    createdBy:
-      item.createdBy?.name ||
-      [item.createdBy?.firstName, item.createdBy?.lastName]
-        .filter(Boolean)
-        .join(" ") ||
-      "System",
-
-    createdByEmail: item.createdBy?.email || "-",
-
-    createdByRole: item.createdBy?.role || "-",
-
-    status: item.status,
-  }));
-
-  // ========================================
-  // NORMALIZE CONTACTS
-  // ========================================
-
-  const contactData = contacts.map((item) => ({
-    id: item._id,
-
-    recordType: "contact",
-
-    type: "support",
-
-    title: null,
-
-    subject: item.subject,
-
-    titleOrSubject: item.subject,
-
-    message: item.message,
-
-    channels: ["Contact Form"],
-
-    target: item.email,
-
-    sentCount: 1,
-
-    createdAt: item.createdAt,
-
-    createdBy: item.fullName,
-
-    createdByEmail: item.email,
-
-    createdByRole: "Customer",
-
-    status: "Received",
-  }));
-
-  // ========================================
-  // MERGE + SORT
-  // ========================================
-
-  let data = [...notificationData, ...contactData];
-
-  data.sort((a, b) =>
-    sort === "oldest"
-      ? new Date(a.createdAt) - new Date(b.createdAt)
-      : new Date(b.createdAt) - new Date(a.createdAt),
-  );
-
-  // ========================================
-  // PAGINATION
-  // ========================================
-
-  const total = data.length;
-
-  const start = (page - 1) * limit;
-
-  const end = start + limit;
-
-  const paginatedData = data.slice(start, end);
-
   const pages = Math.ceil(total / limit);
-
-  // ========================================
-  // RESPONSE
-  // ========================================
 
   return res.status(200).json({
     success: true,
 
-    notifications: paginatedData,
+    notifications,
 
     metrics: {
       total,
@@ -690,12 +852,16 @@ export const adminGetAllNotifications = tryCatchFn(async (req, res) => {
 });
 
 // ============================================================
-// ADMIN - MARK SINGLE NOTIFICATION AS READ
+// ADMIN MARK NOTIFICATION AS READ
 // PATCH /api/admin/notifications/:id/read
 // ============================================================
 
 export const markNotificationAsRead = tryCatchFn(async (req, res) => {
   const { id } = req.params;
+
+  if (!id) {
+    throw responseHandler.badRequestResponse("Notification ID is required");
+  }
 
   const notification = await Notification.findById(id);
 
@@ -705,19 +871,17 @@ export const markNotificationAsRead = tryCatchFn(async (req, res) => {
 
   notification.read = true;
 
-  // ========================================
-  // PREVENT DUPLICATE READ USERS
-  // ========================================
+  const adminId = req.user?._id;
 
-  const userId = req.user?._id;
+  if (adminId && notification.isBroadcast) {
+    notification.readBy = notification.readBy || [];
 
-  if (userId) {
-    const alreadyRead = notification.readBy?.some(
-      (existingUserId) => existingUserId.toString() === userId.toString(),
-    );
-
-    if (!alreadyRead) {
-      notification.readBy.push(userId);
+    if (
+      !notification.readBy.some(
+        (existingId) => existingId.toString() === adminId.toString(),
+      )
+    ) {
+      notification.readBy.push(adminId);
     }
   }
 
@@ -725,26 +889,28 @@ export const markNotificationAsRead = tryCatchFn(async (req, res) => {
 
   return res.status(200).json({
     success: true,
+
     message: "Notification marked as read",
+
     notification,
   });
 });
 
 // ============================================================
-// ADMIN - MARK ALL NOTIFICATIONS AS READ
+// ADMIN MARK ALL AS READ
 // PATCH /api/admin/notifications/read-all
 // ============================================================
 
 export const markAllNotificationsAsRead = tryCatchFn(async (req, res) => {
-  const userId = req.user?._id;
+  const adminId = req.user?._id;
 
-  if (!userId) {
+  if (!adminId) {
     throw responseHandler.unauthorizedResponse("Authentication required");
   }
 
-  // Mark all unread notifications as read
   await Notification.updateMany(
     {
+      isBroadcast: false,
       read: false,
     },
     {
@@ -754,28 +920,29 @@ export const markAllNotificationsAsRead = tryCatchFn(async (req, res) => {
     },
   );
 
-  // Add current admin to readBy
   await Notification.updateMany(
     {
+      isBroadcast: true,
       readBy: {
-        $ne: userId,
+        $ne: adminId,
       },
     },
     {
       $addToSet: {
-        readBy: userId,
+        readBy: adminId,
       },
     },
   );
 
   return res.status(200).json({
     success: true,
+
     message: "All notifications marked as read",
   });
 });
 
 // ============================================================
-// ADMIN - DELETE SINGLE NOTIFICATION
+// ADMIN DELETE SINGLE
 // DELETE /api/admin/notifications/:id
 // ============================================================
 
@@ -792,12 +959,13 @@ export const adminDeleteNotification = tryCatchFn(async (req, res) => {
 
   return res.status(200).json({
     success: true,
+
     message: "Notification deleted successfully",
   });
 });
 
 // ============================================================
-// ADMIN - DELETE ALL NOTIFICATIONS
+// ADMIN DELETE ALL
 // DELETE /api/admin/notifications
 // ============================================================
 

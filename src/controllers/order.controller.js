@@ -28,6 +28,7 @@ export const createOrder = async (req, res) => {
     // ------------------------------------------
     // Validate user
     // ------------------------------------------
+
     if (!userId) {
       return res.status(400).json({
         success: false,
@@ -54,6 +55,7 @@ export const createOrder = async (req, res) => {
     // ------------------------------------------
     // Validate payment method
     // ------------------------------------------
+
     if (!paymentMethod) {
       return res.status(400).json({
         success: false,
@@ -73,6 +75,7 @@ export const createOrder = async (req, res) => {
     // ------------------------------------------
     // Validate items
     // ------------------------------------------
+
     if (!Array.isArray(items) || items.length === 0) {
       return res.status(400).json({
         success: false,
@@ -81,8 +84,9 @@ export const createOrder = async (req, res) => {
     }
 
     // ------------------------------------------
-    // Validate total amount
+    // Validate total
     // ------------------------------------------
+
     const numericTotal = Number(totalAmount);
 
     if (!Number.isFinite(numericTotal) || numericTotal <= 0) {
@@ -95,6 +99,7 @@ export const createOrder = async (req, res) => {
     // ------------------------------------------
     // Validate transfer details
     // ------------------------------------------
+
     if (normalizedPaymentMethod === "transfer") {
       const accountNumber =
         senderAccountNumber ||
@@ -124,20 +129,15 @@ export const createOrder = async (req, res) => {
     // ------------------------------------------
     // Create order
     // ------------------------------------------
+
     const newOrder = await Order.create({
       userId,
-
       addressType,
-
       shippingAddress,
-
       isForFriend: Boolean(isForFriend),
-
       paymentMethod: normalizedPaymentMethod,
-
       receivingBank:
         normalizedPaymentMethod === "transfer" ? receivingBank : null,
-
       senderAccountDetails:
         normalizedPaymentMethod === "transfer"
           ? {
@@ -145,14 +145,12 @@ export const createOrder = async (req, res) => {
                 senderAccountNumber ||
                 transferDetails?.userAccountNumber ||
                 transferDetails?.accountNumber,
-
               accountName:
                 verifiedAccountName ||
                 transferDetails?.userAccountName ||
                 transferDetails?.accountName,
             }
           : null,
-
       transferDetails:
         normalizedPaymentMethod === "transfer" ? transferDetails || null : null,
 
@@ -173,12 +171,88 @@ export const createOrder = async (req, res) => {
           : "Awaiting_Transfer",
     });
 
+    // ======================================================
+    // WAGBA PERSONAL NOTIFICATION
+    // ======================================================
+
+    if (normalizedPaymentMethod === "wallet") {
+      await createNotification({
+        userId: user._id,
+
+        title: "Order Placed Successfully",
+
+        message: `Your order ${newOrder.orderId || newOrder._id} has been placed successfully. Your wallet payment of ₦${numericTotal.toLocaleString(
+          "en-NG",
+          {
+            minimumFractionDigits: 2,
+            maximumFractionDigits: 2,
+          },
+        )} has been received.`,
+
+        category: "orders",
+
+        type: "orders",
+
+        metadata: {
+          orderId: newOrder._id,
+          orderNumber: newOrder.orderId,
+
+          amount: numericTotal,
+
+          currency: "NGN",
+
+          paymentMethod: "wallet",
+
+          paymentStatus: "successful",
+
+          orderStatus: newOrder.orderStatus,
+        },
+      });
+    } else {
+      await createNotification({
+        userId: user._id,
+
+        title: "Order Created - Payment Pending",
+
+        message: `Your order ${
+          newOrder.orderId || newOrder._id
+        } has been created. Please complete the bank transfer to confirm your order.`,
+
+        category: "orders",
+
+        type: "orders",
+
+        metadata: {
+          orderId: newOrder._id,
+          orderNumber: newOrder.orderId,
+
+          amount: numericTotal,
+
+          currency: "NGN",
+
+          paymentMethod: "transfer",
+
+          paymentStatus: "pending",
+
+          orderStatus: newOrder.orderStatus,
+
+          receivingBank: receivingBank || null,
+        },
+      });
+    }
+
+    // ------------------------------------------
+    // Response
+    // ------------------------------------------
+
     return res.status(201).json({
       success: true,
+
       message:
         normalizedPaymentMethod === "wallet"
           ? "Order placed successfully."
           : "Order created. Please complete the bank transfer to confirm your order.",
+
       data: newOrder,
     });
   } catch (error) {
@@ -190,7 +264,6 @@ export const createOrder = async (req, res) => {
     });
   }
 };
-
 // ==========================================================
 // PROCESS CHECKOUT
 // POST /api/orders/checkout
@@ -216,6 +289,7 @@ export const processCheckout = async (req, res) => {
     // ------------------------------------------
     // Validate required fields
     // ------------------------------------------
+
     if (!userId) {
       return res.status(400).json({
         success: false,
@@ -265,6 +339,7 @@ export const processCheckout = async (req, res) => {
     // ------------------------------------------
     // Find user
     // ------------------------------------------
+
     const user = await User.findById(userId);
 
     if (!user) {
@@ -277,20 +352,27 @@ export const processCheckout = async (req, res) => {
     // ======================================================
     // WALLET PAYMENT
     // ======================================================
+
     if (normalizedPaymentMethod === "wallet") {
       const walletBalance = Number(user.walletBalance) || 0;
 
       if (walletBalance < numericTotal) {
         return res.status(400).json({
           success: false,
+
           message:
             "Insufficient wallet balance. Please top up your wallet or use bank transfer.",
+
           walletBalance,
+
           requiredAmount: numericTotal,
         });
       }
 
-      // Deduct wallet balance
+      // ------------------------------------------
+      // Deduct wallet
+      // ------------------------------------------
+
       user.walletBalance = walletBalance - numericTotal;
 
       await user.save();
@@ -299,6 +381,7 @@ export const processCheckout = async (req, res) => {
     // ======================================================
     // BANK TRANSFER
     // ======================================================
+
     if (normalizedPaymentMethod === "transfer") {
       if (!senderAccountNumber || String(senderAccountNumber).length !== 10) {
         return res.status(400).json({
@@ -315,9 +398,10 @@ export const processCheckout = async (req, res) => {
       }
     }
 
-    // ------------------------------------------
-    // Create order
-    // ------------------------------------------
+    // ======================================================
+    // CREATE ORDER
+    // ======================================================
+
     const newOrder = await Order.create({
       userId,
 
@@ -360,6 +444,88 @@ export const processCheckout = async (req, res) => {
           : "Awaiting_Transfer",
     });
 
+    // ======================================================
+    // CREATE PERSONAL NOTIFICATION
+    // ======================================================
+
+    if (normalizedPaymentMethod === "wallet") {
+      await createNotification({
+        userId: user._id,
+
+        title: "Order Placed Successfully",
+
+        message: `Your order ${
+          newOrder.orderId || newOrder._id
+        } has been placed successfully. Your wallet payment of ₦${numericTotal.toLocaleString(
+          "en-NG",
+          {
+            minimumFractionDigits: 2,
+            maximumFractionDigits: 2,
+          },
+        )} has been received.`,
+
+        category: "orders",
+
+        type: "orders",
+
+        metadata: {
+          orderId: newOrder._id,
+
+          orderNumber: newOrder.orderId,
+
+          amount: numericTotal,
+
+          currency: "NGN",
+
+          paymentMethod: "wallet",
+
+          paymentStatus: "successful",
+
+          orderStatus: newOrder.orderStatus,
+
+          deliveryFee: Number(deliveryFee) || 0,
+        },
+      });
+    }
+
+    if (normalizedPaymentMethod === "transfer") {
+      await createNotification({
+        userId: user._id,
+
+        title: "Order Awaiting Payment",
+
+        message: `Your order ${
+          newOrder.orderId || newOrder._id
+        } has been created. Complete the bank transfer to confirm your order.`,
+
+        category: "orders",
+
+        type: "orders",
+
+        metadata: {
+          orderId: newOrder._id,
+
+          orderNumber: newOrder.orderId,
+
+          amount: numericTotal,
+
+          currency: "NGN",
+
+          paymentMethod: "transfer",
+
+          paymentStatus: "pending",
+
+          orderStatus: newOrder.orderStatus,
+
+          receivingBank: receivingBank || null,
+        },
+      });
+    }
+
+    // ======================================================
+    // RESPONSE
+    // ======================================================
+
     return res.status(201).json({
       success: true,
 
@@ -375,13 +541,13 @@ export const processCheckout = async (req, res) => {
 
     return res.status(500).json({
       success: false,
+
       message:
         error.message ||
         "An internal server error occurred while placing the order.",
     });
   }
 };
-
 // ==========================================================
 // GET ALL ORDERS
 // GET /api/orders
@@ -782,59 +948,154 @@ export const updateOrderStatus = async (req, res) => {
     if (!normalizedStatus) {
       return res.status(400).json({
         success: false,
+
         message: `Invalid status. Choose from: ${validStatuses.join(", ")}`,
       });
     }
 
-    let updatedOrder;
+    // ------------------------------------------
+    // Find order
+    // ------------------------------------------
+
+    let order;
 
     if (mongoose.Types.ObjectId.isValid(id)) {
-      updatedOrder = await Order.findByIdAndUpdate(
-        id,
-        {
-          $set: {
-            orderStatus: normalizedStatus,
-          },
-        },
-        {
-          new: true,
-          runValidators: true,
-        },
-      );
+      order = await Order.findById(id);
     }
 
-    if (!updatedOrder) {
-      updatedOrder = await Order.findOneAndUpdate(
-        { orderId: id },
-        {
-          $set: {
-            orderStatus: normalizedStatus,
-          },
-        },
-        {
-          new: true,
-          runValidators: true,
-        },
-      );
+    if (!order) {
+      order = await Order.findOne({
+        orderId: id,
+      });
     }
 
-    if (!updatedOrder) {
+    if (!order) {
       return res.status(404).json({
         success: false,
         message: "Order not found.",
       });
     }
 
+    const previousStatus = order.orderStatus;
+
+    // ------------------------------------------
+    // Update status
+    // ------------------------------------------
+
+    order.orderStatus = normalizedStatus;
+
+    await order.save();
+
+    // ------------------------------------------
+    // Get customer
+    // ------------------------------------------
+
+    const customer = await User.findById(order.userId);
+
+    // ------------------------------------------
+    // Notification messages
+    // ------------------------------------------
+
+    const statusNotifications = {
+      Pending: {
+        title: "Order Pending",
+        message: `Your order ${
+          order.orderId || order._id
+        } is currently pending.`,
+      },
+
+      Processing: {
+        title: "Order Processing",
+        message: `Your order ${
+          order.orderId || order._id
+        } is now being processed.`,
+      },
+
+      Preparing: {
+        title: "Your Food Is Being Prepared",
+        message: `The restaurant has started preparing your order ${
+          order.orderId || order._id
+        }.`,
+      },
+
+      "Out for Delivery": {
+        title: "Order Out for Delivery",
+        message: `Your order ${
+          order.orderId || order._id
+        } is now out for delivery.`,
+      },
+
+      Delivered: {
+        title: "Order Delivered",
+        message: `Your order ${
+          order.orderId || order._id
+        } has been delivered. Enjoy your meal!`,
+      },
+
+      Cancelled: {
+        title: "Order Cancelled",
+        message: `Your order ${order.orderId || order._id} has been cancelled.`,
+      },
+
+      Awaiting_Transfer: {
+        title: "Payment Verification Required",
+        message: `Your order ${
+          order.orderId || order._id
+        } is waiting for bank transfer verification.`,
+      },
+    };
+
+    const notification = statusNotifications[normalizedStatus];
+
+    // ------------------------------------------
+    // Create personal notification
+    // ------------------------------------------
+
+    if (customer && notification) {
+      await createNotification({
+        userId: customer._id,
+
+        title: notification.title,
+
+        message: notification.message,
+
+        category: "orders",
+
+        type: "orders",
+
+        metadata: {
+          orderId: order._id,
+
+          orderNumber: order.orderId,
+
+          previousStatus,
+
+          orderStatus: normalizedStatus,
+
+          paymentMethod: order.paymentMethod,
+
+          paymentStatus: order.paymentStatus,
+
+          amount: order.totalAmount,
+
+          currency: "NGN",
+        },
+      });
+    }
+
     return res.status(200).json({
       success: true,
+
       message: "Order status updated successfully.",
-      data: updatedOrder,
+
+      data: order,
     });
   } catch (error) {
     console.error("Update Order Status Error:", error);
 
     return res.status(500).json({
       success: false,
+
       message: error.message || "Error updating order status.",
     });
   }

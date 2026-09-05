@@ -1,5 +1,6 @@
 import jwt from "jsonwebtoken";
 import User from "../models/user.js";
+import TokenBlacklist from "../models/tokenbalcklist.js";
 import responseHandler from "../libs/responseHandler.js";
 import tryCatchFn from "../libs/tryCatchFn.js";
 
@@ -12,6 +13,7 @@ export const protect = tryCatchFn(async (req, res, next) => {
   // =====================================
   // GET ACCESS TOKEN
   // =====================================
+
   const authHeader = req.headers.authorization;
 
   if (authHeader && authHeader.startsWith("Bearer ")) {
@@ -25,8 +27,23 @@ export const protect = tryCatchFn(async (req, res, next) => {
   }
 
   // =====================================
+  // CHECK TOKEN BLACKLIST
+  // =====================================
+
+  const blacklistedToken = await TokenBlacklist.findOne({
+    token: accessToken,
+  }).lean();
+
+  if (blacklistedToken) {
+    throw responseHandler.unauthorizedResponse(
+      "Your session has been logged out. Please login again.",
+    );
+  }
+
+  // =====================================
   // VERIFY ACCESS TOKEN
   // =====================================
+
   let decoded;
 
   try {
@@ -42,8 +59,17 @@ export const protect = tryCatchFn(async (req, res, next) => {
   }
 
   // =====================================
+  // VALIDATE TOKEN PAYLOAD
+  // =====================================
+
+  if (!decoded?.id) {
+    throw responseHandler.unauthorizedResponse("Invalid access token payload.");
+  }
+
+  // =====================================
   // FIND USER
   // =====================================
+
   const user = await User.findById(decoded.id).select(
     "_id fullName email phone state role",
   );
@@ -57,6 +83,7 @@ export const protect = tryCatchFn(async (req, res, next) => {
   // =====================================
   // ATTACH USER TO REQUEST
   // =====================================
+
   req.user = {
     _id: user._id,
     id: user._id,
@@ -66,6 +93,10 @@ export const protect = tryCatchFn(async (req, res, next) => {
     state: user.state,
     role: user.role,
   };
+
+  // =====================================
+  // CONTINUE
+  // =====================================
 
   next();
 });
@@ -78,14 +109,40 @@ export const protect = tryCatchFn(async (req, res, next) => {
 export const optionalProtect = tryCatchFn(async (req, res, next) => {
   const authHeader = req.headers.authorization;
 
+  // No token = continue as guest
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
     return next();
   }
 
   const accessToken = authHeader.split(" ")[1];
 
+  // =====================================
+  // CHECK BLACKLIST
+  // =====================================
+
+  const blacklistedToken = await TokenBlacklist.findOne({
+    token: accessToken,
+  }).lean();
+
+  // Logged-out token behaves like guest
+  if (blacklistedToken) {
+    return next();
+  }
+
+  // =====================================
+  // VERIFY TOKEN
+  // =====================================
+
   try {
     const decoded = jwt.verify(accessToken, process.env.JWT_SECRET_KEY);
+
+    if (!decoded?.id) {
+      return next();
+    }
+
+    // ===================================
+    // FIND USER
+    // ===================================
 
     const user = await User.findById(decoded.id).select(
       "_id fullName email phone state role",
@@ -103,8 +160,9 @@ export const optionalProtect = tryCatchFn(async (req, res, next) => {
       };
     }
   } catch (error) {
-    // For optional authentication, simply continue
-    // as a guest if the token is invalid/expired.
+    // Optional authentication:
+    // invalid/expired token simply behaves
+    // like a guest.
   }
 
   next();
@@ -115,6 +173,10 @@ export const optionalProtect = tryCatchFn(async (req, res, next) => {
 // =====================================
 export const authorize = (...roles) => {
   return (req, res, next) => {
+    // ===================================
+    // CHECK AUTHENTICATION
+    // ===================================
+
     if (!req.user) {
       return next(
         responseHandler.unauthorizedResponse(
@@ -122,6 +184,10 @@ export const authorize = (...roles) => {
         ),
       );
     }
+
+    // ===================================
+    // CHECK ROLE
+    // ===================================
 
     if (!roles.includes(req.user.role)) {
       return next(
@@ -136,16 +202,7 @@ export const authorize = (...roles) => {
 };
 
 // =====================================
-// ADMIN ONLY
-// =====================================
-export const adminOnly = authorize("admin");
-
-// =====================================
-// CUSTOMER ONLY
-// =====================================
-export const customerOnly = authorize("user", "customer");
-
-// =====================================
 // DEFAULT EXPORT
 // =====================================
+
 export default protect;

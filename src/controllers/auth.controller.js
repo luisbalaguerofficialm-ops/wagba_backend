@@ -3,9 +3,11 @@ import { createSendToken } from "../libs/token.js";
 import responseHandler from "../libs/responseHandler.js";
 import tryCatchFn from "../libs/tryCatchFn.js";
 import { OAuth2Client } from "google-auth-library";
-
+import TokenBlacklist from "../models/tokenbalcklist.js";
 const googleClient = new OAuth2Client(process.env.GOOGLE_CLIENT_ID);
+import { generateOTP, hashOTP, verifyOTP } from "../utils/otp.js";
 
+import { sendOTP } from "../services/otpService.js";
 // ==========================================
 // VALID NIGERIAN STATES
 // ==========================================
@@ -174,6 +176,18 @@ export const registerUser = tryCatchFn(async (req, res) => {
 
   const { accessToken, refreshToken, cookieOptions } = createSendToken(user);
 
+  await createNotification({
+    userId: user._id,
+    title: "Welcome to WAGBA",
+    message: `Welcome to WAGBA, ${user.fullName}! Your account has been created successfully.`,
+    category: "authentication",
+    type: "authentication",
+    metadata: {
+      action: "account_created",
+      authProvider: "local",
+      email: user.email,
+    },
+  });
   // ----------------------------------------
   // Refresh token cookie
   // ----------------------------------------
@@ -260,6 +274,17 @@ export const loginUser = tryCatchFn(async (req, res) => {
 
   const { accessToken, refreshToken, cookieOptions } = createSendToken(user);
 
+  await createNotification({
+    userId: user._id,
+    title: "Login Successful",
+    message: "You successfully logged into your WAGBA account.",
+    category: "authentication",
+    type: "authentication",
+    metadata: {
+      action: "login",
+      authProvider: "local",
+    },
+  });
   // ----------------------------------------
   // Store refresh token
   // ----------------------------------------
@@ -393,6 +418,20 @@ export const googleAuth = tryCatchFn(async (req, res) => {
 
   const { accessToken, refreshToken, cookieOptions } = createSendToken(user);
 
+  await createNotification({
+    userId: user._id,
+    title: isNewUser ? "Welcome to WAGBA" : "Google Login Successful",
+    message: isNewUser
+      ? `Welcome to WAGBA, ${user.fullName}! Your Google account has been created successfully.`
+      : "You successfully signed in to your WAGBA account with Google.",
+    category: "authentication",
+    type: "authentication",
+    metadata: {
+      action: isNewUser ? "account_created" : "google_login",
+      authProvider: "google",
+    },
+  });
+
   // ----------------------------------------
   // Refresh token cookie
   // ----------------------------------------
@@ -476,15 +515,13 @@ export const logout = async (req, res) => {
     if (user) {
       await createNotification({
         userId: user._id,
-
-        title: "system",
-        message: "You logged out of your account.",
-        type: "logout",
-        category: "system",
-        channels: ["In-App"],
-        target: "Individual",
-        status: "Delivered",
-        sentToCount: 1,
+        title: "Logged Out",
+        message: "You logged out of your WAGBA account.",
+        category: "authentication",
+        type: "authentication",
+        metadata: {
+          action: "logout",
+        },
       });
     }
 
@@ -497,49 +534,6 @@ export const logout = async (req, res) => {
     return res.status(500).json({
       success: false,
       message: "Failed to logout",
-    });
-  }
-};
-
-export const refreshToken = async (req, res) => {
-  try {
-    const refreshToken = req.cookies?.refreshToken;
-
-    if (!refreshToken) {
-      return res.status(401).json({
-        success: false,
-        message: "No refresh token provided",
-      });
-    }
-
-    // Verify refresh token
-    const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
-
-    const user = await User.findById(decoded.id);
-
-    if (!user || user.refreshToken !== refreshToken) {
-      return res.status(403).json({
-        success: false,
-        message: "Invalid refresh token",
-      });
-    }
-
-    // Issue new access token
-    const newAccessToken = jwt.sign(
-      { id: user._id, role: user.role },
-      process.env.JWT_SECRET,
-      { expiresIn: "20m" },
-    );
-
-    res.json({
-      success: true,
-      token: newAccessToken,
-    });
-  } catch (err) {
-    console.error("Refresh token error:", err);
-    return res.status(403).json({
-      success: false,
-      message: "Refresh token expired or invalid",
     });
   }
 };
@@ -580,16 +574,14 @@ export const forgotPassword = async (req, res) => {
 
     await createNotification({
       userId: user._id,
-
       title: "Password Reset Requested",
-      message: "A password reset verification code was requested.",
-      type: "password_reset",
+      message:
+        "A password reset verification code was requested for your WAGBA account.",
       category: "security",
-      channels: ["Email"],
-      target: "Individual",
-      status: "Delivered",
-      sentToCount: 1,
-      email: user.email,
+      type: "security",
+      metadata: {
+        action: "password_reset_requested",
+      },
     });
 
     await sendOTP({
@@ -670,7 +662,17 @@ export const verifyForgotPasswordOtp = async (req, res) => {
     user.otpPurpose = null;
 
     await user.save();
-
+    await createNotification({
+      userId: user._id,
+      title: "Password Reset Verified",
+      message:
+        "Your password reset verification code was successfully verified.",
+      category: "security",
+      type: "security",
+      metadata: {
+        action: "password_reset_otp_verified",
+      },
+    });
     return res.json({
       success: true,
       message: "OTP verified",
@@ -688,19 +690,19 @@ export const verifyForgotPasswordOtp = async (req, res) => {
 
 export const resetPassword = async (req, res) => {
   try {
-    const { token, password, confirmPassword } = req.body;
+    const { token, password } = req.body;
 
-    if (!token || !password || !confirmPassword) {
+    if (!token || !password) {
       return res.status(400).json({
         success: false,
         message: "All fields are required",
       });
     }
 
-    if (password !== confirmPassword) {
+    if (!password) {
       return res.status(400).json({
         success: false,
-        message: "Passwords do not match",
+        message: "Password is required",
       });
     }
 
@@ -736,16 +738,13 @@ export const resetPassword = async (req, res) => {
 
     await createNotification({
       userId: user._id,
-
       title: "Password Reset Successful",
-      message: "Your password has been reset successfully.",
-      type: "authentication",
+      message: "Your WAGBA password has been reset successfully.",
       category: "security",
-      channels: ["Email", "In-App"],
-      target: "Individual",
-      status: "Delivered",
-      sentToCount: 1,
-      email: user.email,
+      type: "security",
+      metadata: {
+        action: "password_reset_completed",
+      },
     });
 
     return res.json({

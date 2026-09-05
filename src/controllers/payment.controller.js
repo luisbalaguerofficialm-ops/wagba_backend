@@ -1,5 +1,9 @@
-import responseHandler from "../libs/responseHandler.js";
 import mongoose from "mongoose";
+
+import responseHandler from "../libs/responseHandler.js";
+import tryCatchFn from "../libs/tryCatchFn.js";
+
+import { createNotification } from "../controllers/notification.controller.js";
 
 import {
   initializePayment,
@@ -21,190 +25,379 @@ import Transaction from "../models/transaction.js";
 
 /**
  * ============================================================
+ * HELPER: CREATE PAYMENT NOTIFICATION
+ * ============================================================
+ */
+
+const notifyPaymentActivity = async ({
+  userId,
+  title,
+  message,
+  type = "transaction",
+  metadata = {},
+}) => {
+  if (!userId) return null;
+
+  return await createNotification({
+    userId,
+    title,
+    message,
+    category: "transaction",
+    type,
+    metadata: {
+      currency: "NGN",
+      ...metadata,
+    },
+  });
+};
+
+/**
+ * ============================================================
  * 1. INITIALIZE PAYMENT
  * ============================================================
  *
- * IMPORTANT:
- * We do NOT store the full card number, CVV, or other
- * sensitive card details in our database.
- *
- * Paystack handles the actual card collection through checkout.
+ * Wallet top-up through Paystack.
  */
-export const processPayment = async (req, res) => {
-  try {
-    const { amount, email, userId } = req.body;
 
-    // -----------------------------------------
-    // Validate required fields
-    // -----------------------------------------
-    if (!amount || !email || !userId) {
-      return responseHandler.errorResponse(
-        res,
-        "Amount, email and userId are required",
-        400,
-      );
-    }
+export const processPayment = tryCatchFn(async (req, res) => {
+  const { amount, email, userId } = req.body;
 
-    const parsedAmount = Number(amount);
+  // -----------------------------------------
+  // Validate required fields
+  // -----------------------------------------
 
-    if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
-      return responseHandler.errorResponse(
-        res,
-        "Amount must be a valid number greater than zero",
-        400,
-      );
-    }
-
-    // -----------------------------------------
-    // Check user exists
-    // -----------------------------------------
-    const user = await User.findById(userId);
-
-    if (!user) {
-      return responseHandler.errorResponse(res, "User not found", 404);
-    }
-
-    // -----------------------------------------
-    // Initialize Paystack payment
-    // -----------------------------------------
-    const paymentResponse = await initializePayment(parsedAmount, email, {
-      userId: userId.toString(),
-      type: "WALLET_TOPUP",
-    });
-
-    return responseHandler.successResponse(
-      res,
-      paymentResponse,
-      "Payment initialized successfully",
-      200,
-    );
-  } catch (error) {
-    console.error("processPayment error:", error);
-
-    return responseHandler.errorResponse(
-      res,
-      error.message || "Payment initialization failed",
-      500,
-      error,
+  if (!amount || !email || !userId) {
+    throw responseHandler.errorResponse(
+      "Amount, email and userId are required",
+      400,
     );
   }
-};
+
+  const parsedAmount = Number(amount);
+
+  if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
+    throw responseHandler.errorResponse(
+      "Amount must be a valid number greater than zero",
+      400,
+    );
+  }
+
+  // -----------------------------------------
+  // Check user
+  // -----------------------------------------
+
+  const user = await User.findById(userId);
+
+  if (!user) {
+    throw responseHandler.errorResponse("User not found", 404);
+  }
+
+  // -----------------------------------------
+  // Initialize Paystack
+  // -----------------------------------------
+
+  const paymentResponse = await initializePayment(parsedAmount, email, {
+    userId: userId.toString(),
+    type: "WALLET_TOPUP",
+  });
+
+  // -----------------------------------------
+  // Notification
+  // -----------------------------------------
+
+  await notifyPaymentActivity({
+    userId: user._id,
+    title: "Wallet Top-Up Started",
+    message: `Your ₦${parsedAmount.toLocaleString()} wallet top-up has been initiated. Complete the payment to credit your WAGBA wallet.`,
+    metadata: {
+      amount: parsedAmount,
+      paymentMethod: "paystack",
+      paymentStatus: "pending",
+      action: "wallet_topup_initialized",
+    },
+  });
+
+  return responseHandler.successResponse(
+    res,
+    paymentResponse,
+    "Payment initialized successfully",
+    200,
+  );
+});
 
 /**
  * ============================================================
  * 2. VERIFY AND COMPLETE PAYMENT
  * ============================================================
  */
-export const verifyAndCompletePayment = async (req, res) => {
-  try {
-    const { reference } = req.query;
 
-    if (!reference) {
-      return responseHandler.errorResponse(
-        res,
-        "Payment reference is required",
-        400,
-      );
-    }
+export const verifyAndCompletePayment = tryCatchFn(async (req, res) => {
+  const { reference } = req.query;
 
-    // -----------------------------------------
-    // Verify transaction with Paystack
-    // -----------------------------------------
-    const verification = await verifyPayment(reference);
+  if (!reference) {
+    throw responseHandler.errorResponse("Payment reference is required", 400);
+  }
 
-    if (!verification) {
-      return responseHandler.errorResponse(
-        res,
-        "Payment verification failed",
-        400,
-      );
-    }
+  // -----------------------------------------
+  // Verify Paystack transaction
+  // -----------------------------------------
 
-    // -----------------------------------------
-    // Check Paystack transaction status
-    // -----------------------------------------
-    if (verification.status !== "success") {
-      return responseHandler.errorResponse(
-        res,
-        verification.gateway_response || "Payment was not successful",
-        400,
-      );
-    }
+  const verification = await verifyPayment(reference);
 
-    // -----------------------------------------
-    // Get user ID from metadata
-    // -----------------------------------------
-    const userId =
-      verification.metadata?.userId || verification.metadata?.user_id;
+  if (!verification) {
+    throw responseHandler.errorResponse("Payment verification failed", 400);
+  }
 
-    if (!userId) {
-      return responseHandler.errorResponse(
-        res,
-        "User information was not found in payment metadata",
-        400,
-      );
-    }
+  // -----------------------------------------
+  // Check transaction status
+  // -----------------------------------------
 
-    // -----------------------------------------
-    // Make sure user exists
-    // -----------------------------------------
-    const user = await User.findById(userId);
+  if (verification.status !== "success") {
+    throw responseHandler.errorResponse(
+      verification.gateway_response || "Payment was not successful",
+      400,
+    );
+  }
 
-    if (!user) {
-      return responseHandler.errorResponse(
-        res,
-        "User associated with this payment was not found",
-        404,
-      );
-    }
+  // -----------------------------------------
+  // Get user ID
+  // -----------------------------------------
 
-    // -----------------------------------------
-    // Prevent duplicate processing
-    // -----------------------------------------
-    const existingTransaction = await Transaction.findOne({
-      reference,
+  const userId =
+    verification.metadata?.userId || verification.metadata?.user_id;
+
+  if (!userId) {
+    throw responseHandler.errorResponse(
+      "User information was not found in payment metadata",
+      400,
+    );
+  }
+
+  // -----------------------------------------
+  // Find user
+  // -----------------------------------------
+
+  const user = await User.findById(userId);
+
+  if (!user) {
+    throw responseHandler.errorResponse(
+      "User associated with this payment was not found",
+      404,
+    );
+  }
+
+  // -----------------------------------------
+  // Prevent duplicate processing
+  // -----------------------------------------
+
+  const existingTransaction = await Transaction.findOne({
+    reference,
+  });
+
+  if (existingTransaction && existingTransaction.status === "success") {
+    const existingWallet = await UserWallet.findOne({
+      userId,
     });
 
-    if (existingTransaction && existingTransaction.status === "success") {
-      const existingWallet = await UserWallet.findOne({
+    return responseHandler.successResponse(
+      res,
+      {
+        paymentStatus: "success",
+        currentBalance: existingWallet?.balance || 0,
+        reference,
+        alreadyProcessed: true,
+      },
+      "Payment has already been processed",
+      200,
+    );
+  }
+
+  // -----------------------------------------
+  // Paystack amount is kobo
+  // -----------------------------------------
+
+  const amount = Number(verification.amount) / 100;
+
+  if (!Number.isFinite(amount) || amount <= 0) {
+    throw responseHandler.errorResponse(
+      "Invalid payment amount returned by Paystack",
+      400,
+    );
+  }
+
+  // -----------------------------------------
+  // Credit wallet
+  // -----------------------------------------
+
+  const wallet = await UserWallet.findOneAndUpdate(
+    { userId },
+    {
+      $inc: {
+        balance: amount,
+      },
+    },
+    {
+      new: true,
+      upsert: true,
+    },
+  );
+
+  // -----------------------------------------
+  // Save reusable authorization
+  // -----------------------------------------
+
+  if (verification.authorization && verification.authorization.reusable) {
+    const auth = verification.authorization;
+
+    await SavedCard.findOneAndUpdate(
+      {
         userId,
-      });
+        paystackAuthCode: auth.authorization_code,
+      },
+      {
+        userId,
+        paystackAuthCode: auth.authorization_code,
+        email: verification.customer?.email || user.email,
+        last4: auth.last4,
+        cardBrand: auth.card_type,
+        expiryMonth: auth.exp_month,
+        expiryYear: auth.exp_year,
+        isDefault: true,
+      },
+      {
+        upsert: true,
+        new: true,
+      },
+    );
+  }
 
-      return responseHandler.successResponse(
-        res,
-        {
-          paymentStatus: "success",
-          currentBalance: existingWallet?.balance || 0,
-          reference,
-          alreadyProcessed: true,
-        },
-        "Payment has already been processed",
-        200,
-      );
-    }
+  // -----------------------------------------
+  // Record transaction
+  // -----------------------------------------
 
-    // -----------------------------------------
-    // Paystack amount is in kobo
-    // Convert to NGN
-    // -----------------------------------------
-    const amount = Number(verification.amount) / 100;
+  const transaction = await Transaction.create({
+    recipientId: userId,
+    type: "TOPUP_PAYSTACK",
+    amount,
+    reference,
+    status: "success",
+  });
 
-    if (!Number.isFinite(amount) || amount <= 0) {
-      return responseHandler.errorResponse(
-        res,
-        "Invalid payment amount returned by Paystack",
-        400,
-      );
-    }
+  // -----------------------------------------
+  // Optional Bitcoin purchase
+  // -----------------------------------------
 
-    // -----------------------------------------
+  let btcTransaction = null;
+
+  try {
+    btcTransaction = await purchaseBitcoin(amount, userId, reference);
+  } catch (bitcoinError) {
+    console.error("Bitcoin purchase failed:", bitcoinError);
+  }
+
+  // -----------------------------------------
+  // PERSONAL NOTIFICATION
+  // -----------------------------------------
+
+  await notifyPaymentActivity({
+    userId: user._id,
+    title: "Wallet Top-Up Successful",
+    message: `₦${amount.toLocaleString()} has been successfully added to your WAGBA wallet.`,
+    metadata: {
+      amount,
+      reference,
+      transactionId: transaction._id,
+      paymentMethod: "paystack",
+      paymentStatus: "success",
+      walletBalance: wallet.balance,
+      action: "wallet_topup",
+    },
+  });
+
+  return responseHandler.successResponse(
+    res,
+    {
+      paymentStatus: verification.status,
+      currentBalance: wallet.balance,
+      amount,
+      reference,
+      bitcoinTransaction: btcTransaction,
+    },
+    "Payment verified and wallet credited successfully",
+    200,
+  );
+});
+
+/**
+ * ============================================================
+ * 3. CHARGE SAVED CARD
+ * ============================================================
+ */
+
+export const topUpFromSavedCard = tryCatchFn(async (req, res) => {
+  const { userId, cardId, amount } = req.body;
+
+  if (!userId || !cardId || !amount) {
+    throw responseHandler.errorResponse(
+      "userId, cardId and amount are required",
+      400,
+    );
+  }
+
+  const parsedAmount = Number(amount);
+
+  if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
+    throw responseHandler.errorResponse(
+      "Amount must be greater than zero",
+      400,
+    );
+  }
+
+  // -----------------------------------------
+  // Find saved card
+  // -----------------------------------------
+
+  const card = await SavedCard.findOne({
+    _id: cardId,
+    userId,
+  });
+
+  if (!card) {
+    throw responseHandler.errorResponse("Saved card not found", 404);
+  }
+
+  if (!card.paystackAuthCode) {
+    throw responseHandler.errorResponse(
+      "This card cannot be charged directly",
+      400,
+    );
+  }
+
+  const reference = `TOPUP_CARD_${Date.now()}_${Math.floor(
+    Math.random() * 10000,
+  )}`;
+
+  // -----------------------------------------
+  // Charge Paystack authorization
+  // -----------------------------------------
+
+  const chargeResult = await chargeAuthorization(
+    parsedAmount,
+    card.email,
+    card.paystackAuthCode,
+    reference,
+  );
+
+  if (chargeResult.status && chargeResult.data?.status === "success") {
+    // ---------------------------------------
     // Credit wallet
-    // -----------------------------------------
+    // ---------------------------------------
+
     const wallet = await UserWallet.findOneAndUpdate(
       { userId },
       {
         $inc: {
-          balance: amount,
+          balance: parsedAmount,
         },
       },
       {
@@ -213,210 +406,84 @@ export const verifyAndCompletePayment = async (req, res) => {
       },
     );
 
-    // -----------------------------------------
-    // Save reusable Paystack authorization
-    // NEVER save card number or CVV
-    // -----------------------------------------
-    if (verification.authorization && verification.authorization.reusable) {
-      const auth = verification.authorization;
-
-      await SavedCard.findOneAndUpdate(
-        {
-          userId,
-          paystackAuthCode: auth.authorization_code,
-        },
-        {
-          userId,
-          paystackAuthCode: auth.authorization_code,
-          email: verification.customer?.email || user.email,
-          last4: auth.last4,
-          cardBrand: auth.card_type,
-          expiryMonth: auth.exp_month,
-          expiryYear: auth.exp_year,
-          isDefault: true,
-        },
-        {
-          upsert: true,
-          new: true,
-        },
-      );
-    }
-
-    // -----------------------------------------
+    // ---------------------------------------
     // Record transaction
-    // -----------------------------------------
-    await Transaction.create({
+    // ---------------------------------------
+
+    const transaction = await Transaction.create({
       recipientId: userId,
-      type: "TOPUP_PAYSTACK",
-      amount,
+      type: "TOPUP_CARD",
+      amount: parsedAmount,
       reference,
       status: "success",
     });
 
-    // -----------------------------------------
-    // Optional Bitcoin purchase
-    // -----------------------------------------
-    let btcTransaction = null;
+    // ---------------------------------------
+    // Notification
+    // ---------------------------------------
 
-    try {
-      btcTransaction = await purchaseBitcoin(amount, userId, reference);
-    } catch (bitcoinError) {
-      console.error("Bitcoin purchase failed:", bitcoinError);
-
-      // We don't fail the successful wallet top-up
-      // just because the optional Bitcoin operation failed.
-    }
+    await notifyPaymentActivity({
+      userId,
+      title: "Wallet Top-Up Successful",
+      message: `₦${parsedAmount.toLocaleString()} has been added to your wallet using your saved card.`,
+      metadata: {
+        amount: parsedAmount,
+        reference,
+        transactionId: transaction._id,
+        paymentMethod: "saved_card",
+        paymentStatus: "success",
+        walletBalance: wallet.balance,
+        cardLast4: card.last4,
+        action: "wallet_topup",
+      },
+    });
 
     return responseHandler.successResponse(
       res,
       {
-        paymentStatus: verification.status,
-        currentBalance: wallet.balance,
-        amount,
+        balance: wallet.balance,
         reference,
-        bitcoinTransaction: btcTransaction,
       },
-      "Payment verified and wallet credited successfully",
+      "Wallet credited successfully via saved card",
       200,
     );
-  } catch (error) {
-    console.error("verifyAndCompletePayment error:", error);
-
-    return responseHandler.errorResponse(
-      res,
-      error.message || "Payment verification failed",
-      500,
-      error,
-    );
   }
-};
 
-/**
- * ============================================================
- * 3. CHARGE SAVED CARD
- * ============================================================
- */
-export const topUpFromSavedCard = async (req, res) => {
-  try {
-    const { userId, cardId, amount } = req.body;
+  // -----------------------------------------
+  // Failed card payment
+  // -----------------------------------------
 
-    if (!userId || !cardId || !amount) {
-      return responseHandler.errorResponse(
-        res,
-        "userId, cardId and amount are required",
-        400,
-      );
-    }
-
-    const parsedAmount = Number(amount);
-
-    if (!Number.isFinite(parsedAmount) || parsedAmount <= 0) {
-      return responseHandler.errorResponse(
-        res,
-        "Amount must be greater than zero",
-        400,
-      );
-    }
-
-    // -----------------------------------------
-    // Find saved card
-    // -----------------------------------------
-    const card = await SavedCard.findOne({
-      _id: cardId,
-      userId,
-    });
-
-    if (!card) {
-      return responseHandler.errorResponse(res, "Saved card not found", 404);
-    }
-
-    if (!card.paystackAuthCode) {
-      return responseHandler.errorResponse(
-        res,
-        "This card cannot be charged directly",
-        400,
-      );
-    }
-
-    const reference = `TOPUP_CARD_${Date.now()}_${Math.floor(
-      Math.random() * 10000,
-    )}`;
-
-    // -----------------------------------------
-    // Charge Paystack authorization
-    // -----------------------------------------
-    const chargeResult = await chargeAuthorization(
-      parsedAmount,
-      card.email,
-      card.paystackAuthCode,
-      reference,
-    );
-
-    if (chargeResult.status && chargeResult.data?.status === "success") {
-      // -----------------------------------------
-      // Credit wallet
-      // -----------------------------------------
-      const wallet = await UserWallet.findOneAndUpdate(
-        { userId },
-        {
-          $inc: {
-            balance: parsedAmount,
-          },
-        },
-        {
-          new: true,
-          upsert: true,
-        },
-      );
-
-      // -----------------------------------------
-      // Record transaction
-      // -----------------------------------------
-      await Transaction.create({
-        recipientId: userId,
-        type: "TOPUP_CARD",
-        amount: parsedAmount,
-        reference,
-        status: "success",
-      });
-
-      return responseHandler.successResponse(
-        res,
-        {
-          balance: wallet.balance,
-          reference,
-        },
-        "Wallet credited successfully via saved card",
-        200,
-      );
-    }
-
-    return responseHandler.errorResponse(
-      res,
+  await notifyPaymentActivity({
+    userId,
+    title: "Wallet Top-Up Failed",
+    message:
       chargeResult.message ||
-        chargeResult.data?.gateway_response ||
-        "Saved card charge failed",
-      400,
-    );
-  } catch (error) {
-    console.error("topUpFromSavedCard error:", error);
+      chargeResult.data?.gateway_response ||
+      "Your saved card could not be charged.",
+    metadata: {
+      amount: parsedAmount,
+      reference,
+      paymentMethod: "saved_card",
+      paymentStatus: "failed",
+      action: "wallet_topup_failed",
+    },
+  });
 
-    return responseHandler.errorResponse(
-      res,
-      error.response?.data?.message ||
-        error.message ||
-        "Saved card charge failed",
-      500,
-      error,
-    );
-  }
-};
+  return responseHandler.errorResponse(
+    res,
+    chargeResult.message ||
+      chargeResult.data?.gateway_response ||
+      "Saved card charge failed",
+    400,
+  );
+});
 
 /**
  * ============================================================
  * 4. INTERNAL WALLET-TO-WALLET TRANSFER
  * ============================================================
  */
+
 export const transferWalletFunds = async (req, res) => {
   const session = await mongoose.startSession();
 
@@ -443,8 +510,9 @@ export const transferWalletFunds = async (req, res) => {
     }
 
     // -----------------------------------------
-    // Find sender wallet
+    // Sender wallet
     // -----------------------------------------
+
     const senderWallet = await UserWallet.findOne({
       userId: senderUserId,
     }).session(session);
@@ -466,8 +534,9 @@ export const transferWalletFunds = async (req, res) => {
     }
 
     // -----------------------------------------
-    // Find recipient wallet
+    // Recipient wallet
     // -----------------------------------------
+
     const recipientWallet = await UserWallet.findOne({
       $or: [
         {
@@ -492,6 +561,7 @@ export const transferWalletFunds = async (req, res) => {
     // -----------------------------------------
     // Prevent self transfer
     // -----------------------------------------
+
     if (senderWallet.userId.toString() === recipientWallet.userId.toString()) {
       await session.abortTransaction();
 
@@ -505,6 +575,7 @@ export const transferWalletFunds = async (req, res) => {
     // -----------------------------------------
     // Deduct sender
     // -----------------------------------------
+
     senderWallet.balance -= parsedAmount;
 
     await senderWallet.save({
@@ -514,6 +585,7 @@ export const transferWalletFunds = async (req, res) => {
     // -----------------------------------------
     // Credit recipient
     // -----------------------------------------
+
     recipientWallet.balance += parsedAmount;
 
     await recipientWallet.save({
@@ -525,7 +597,8 @@ export const transferWalletFunds = async (req, res) => {
     // -----------------------------------------
     // Record transaction
     // -----------------------------------------
-    await Transaction.create(
+
+    const [transaction] = await Transaction.create(
       [
         {
           senderId: senderWallet.userId,
@@ -542,6 +615,55 @@ export const transferWalletFunds = async (req, res) => {
     );
 
     await session.commitTransaction();
+
+    // -----------------------------------------
+    // Get users for notifications
+    // -----------------------------------------
+
+    const [senderUser, recipientUser] = await Promise.all([
+      User.findById(senderWallet.userId),
+      User.findById(recipientWallet.userId),
+    ]);
+
+    // -----------------------------------------
+    // Sender notification
+    // -----------------------------------------
+
+    await notifyPaymentActivity({
+      userId: senderWallet.userId,
+      title: "Transfer Successful",
+      message: `₦${parsedAmount.toLocaleString()} has been transferred successfully.`,
+      metadata: {
+        amount: parsedAmount,
+        reference,
+        transactionId: transaction._id,
+        paymentMethod: "wallet",
+        transferType: "wallet_to_wallet",
+        recipientId: recipientWallet.userId,
+        walletBalance: senderWallet.balance,
+        action: "wallet_transfer_sent",
+      },
+    });
+
+    // -----------------------------------------
+    // Recipient notification
+    // -----------------------------------------
+
+    await notifyPaymentActivity({
+      userId: recipientWallet.userId,
+      title: "Money Received",
+      message: `You received ₦${parsedAmount.toLocaleString()} in your WAGBA wallet.`,
+      metadata: {
+        amount: parsedAmount,
+        reference,
+        transactionId: transaction._id,
+        paymentMethod: "wallet",
+        transferType: "wallet_to_wallet",
+        senderId: senderWallet.userId,
+        walletBalance: recipientWallet.balance,
+        action: "wallet_transfer_received",
+      },
+    });
 
     return responseHandler.successResponse(
       res,
@@ -575,287 +697,260 @@ export const transferWalletFunds = async (req, res) => {
  * 5. GET SUPPORTED BANKS
  * ============================================================
  */
-export const getBanksList = async (req, res) => {
-  try {
-    const banks = await fetchSupportedBanks();
 
-    return responseHandler.successResponse(
-      res,
-      banks.data || banks,
-      "Banks retrieved successfully",
-      200,
-    );
-  } catch (error) {
-    console.error("getBanksList error:", error);
+export const getBanksList = tryCatchFn(async (req, res) => {
+  const banks = await fetchSupportedBanks();
 
-    return responseHandler.errorResponse(
-      res,
-      error.message || "Could not retrieve banks",
-      500,
-      error,
-    );
-  }
-};
+  return responseHandler.successResponse(
+    res,
+    banks.data || banks,
+    "Banks retrieved successfully",
+    200,
+  );
+});
 
 /**
  * ============================================================
  * 6. VERIFY BANK ACCOUNT
  * ============================================================
- *
- * This is the function your bank.routes.js should import:
- *
- * verifyBankAccountDetails
  */
-export const verifyBankAccountDetails = async (req, res) => {
-  try {
-    const { accountNumber, bankCode, userId } = req.body;
 
-    if (!accountNumber || !bankCode || !userId) {
-      return responseHandler.errorResponse(
-        res,
-        "Account number, bank code and user ID are required",
-        400,
-      );
-    }
+export const verifyBankAccountDetails = tryCatchFn(async (req, res) => {
+  const { accountNumber, bankCode, userId } = req.body;
 
-    const cleanAccountNumber = String(accountNumber).replace(/\D/g, "");
-
-    if (cleanAccountNumber.length !== 10) {
-      return responseHandler.errorResponse(
-        res,
-        "Account number must be 10 digits",
-        400,
-      );
-    }
-
-    // -----------------------------------------
-    // Check user
-    // -----------------------------------------
-    const user = await User.findById(userId);
-
-    if (!user) {
-      return responseHandler.errorResponse(res, "User profile not found", 404);
-    }
-
-    // -----------------------------------------
-    // Resolve account with Paystack
-    // -----------------------------------------
-    const resolution = await resolveAccountNumber(cleanAccountNumber, bankCode);
-
-    if (!resolution?.status || !resolution?.data) {
-      return responseHandler.errorResponse(
-        res,
-        resolution?.message || "Could not resolve account details",
-        400,
-      );
-    }
-
-    const resolvedAccountName = resolution.data.account_name;
-
-    if (!resolvedAccountName) {
-      return responseHandler.errorResponse(
-        res,
-        "Account name could not be retrieved",
-        400,
-      );
-    }
-
-    // -----------------------------------------
-    // Compare account name to user profile
-    // -----------------------------------------
-    const fullName = String(user.fullName || "").trim();
-
-    if (!fullName) {
-      return responseHandler.errorResponse(
-        res,
-        "Your profile does not contain a full name",
-        400,
-      );
-    }
-
-    const profileNameParts = fullName
-      .toLowerCase()
-      .split(/\s+/)
-      .filter((part) => part.length > 2);
-
-    const resolvedNameLower = resolvedAccountName.toLowerCase();
-
-    const isNameMatch = profileNameParts.some((part) =>
-      resolvedNameLower.includes(part),
-    );
-
-    if (!isNameMatch) {
-      return responseHandler.errorResponse(
-        res,
-        `Account name "${resolvedAccountName}" does not match your registered profile name "${fullName}".`,
-        400,
-      );
-    }
-
-    return responseHandler.successResponse(
-      res,
-      {
-        accountNumber: cleanAccountNumber,
-        accountName: resolvedAccountName,
-        bankCode,
-        verified: true,
-      },
-      "Account verified successfully",
-      200,
-    );
-  } catch (error) {
-    console.error("verifyBankAccountDetails error:", error);
-
-    return responseHandler.errorResponse(
-      res,
-      error.response?.data?.message ||
-        error.message ||
-        "Invalid account details or network error",
+  if (!accountNumber || !bankCode || !userId) {
+    throw responseHandler.errorResponse(
+      "Account number, bank code and user ID are required",
       400,
-      error,
     );
   }
-};
+
+  const cleanAccountNumber = String(accountNumber).replace(/\D/g, "");
+
+  if (cleanAccountNumber.length !== 10) {
+    throw responseHandler.errorResponse(
+      "Account number must be 10 digits",
+      400,
+    );
+  }
+
+  // -----------------------------------------
+  // Check user
+  // -----------------------------------------
+
+  const user = await User.findById(userId);
+
+  if (!user) {
+    throw responseHandler.errorResponse("User profile not found", 404);
+  }
+
+  // -----------------------------------------
+  // Resolve account
+  // -----------------------------------------
+
+  const resolution = await resolveAccountNumber(cleanAccountNumber, bankCode);
+
+  if (!resolution?.status || !resolution?.data) {
+    throw responseHandler.errorResponse(
+      resolution?.message || "Could not resolve account details",
+      400,
+    );
+  }
+
+  const resolvedAccountName = resolution.data.account_name;
+
+  if (!resolvedAccountName) {
+    throw responseHandler.errorResponse(
+      "Account name could not be retrieved",
+      400,
+    );
+  }
+
+  // -----------------------------------------
+  // Compare account name
+  // -----------------------------------------
+
+  const fullName = String(user.fullName || "").trim();
+
+  if (!fullName) {
+    throw responseHandler.errorResponse(
+      "Your profile does not contain a full name",
+      400,
+    );
+  }
+
+  const profileNameParts = fullName
+    .toLowerCase()
+    .split(/\s+/)
+    .filter((part) => part.length > 2);
+
+  const resolvedNameLower = resolvedAccountName.toLowerCase();
+
+  const isNameMatch = profileNameParts.some((part) =>
+    resolvedNameLower.includes(part),
+  );
+
+  if (!isNameMatch) {
+    throw responseHandler.errorResponse(
+      `Account name "${resolvedAccountName}" does not match your registered profile name "${fullName}".`,
+      400,
+    );
+  }
+
+  return responseHandler.successResponse(
+    res,
+    {
+      accountNumber: cleanAccountNumber,
+      accountName: resolvedAccountName,
+      bankCode,
+      verified: true,
+    },
+    "Account verified successfully",
+    200,
+  );
+});
 
 /**
  * ============================================================
  * 7. SAVE VERIFIED BANK ACCOUNT
  * ============================================================
  */
-export const saveBankAccount = async (req, res) => {
-  try {
-    const { userId, accountNumber, accountName, bankCode, bankName } = req.body;
 
-    if (!userId || !accountNumber || !accountName || !bankCode || !bankName) {
-      return responseHandler.errorResponse(res, "All fields are required", 400);
-    }
+export const saveBankAccount = tryCatchFn(async (req, res) => {
+  const { userId, accountNumber, accountName, bankCode, bankName } = req.body;
 
-    const cleanAccountNumber = String(accountNumber).replace(/\D/g, "");
+  if (!userId || !accountNumber || !accountName || !bankCode || !bankName) {
+    throw responseHandler.errorResponse("All fields are required", 400);
+  }
 
-    if (cleanAccountNumber.length !== 10) {
-      return responseHandler.errorResponse(
-        res,
-        "Account number must be 10 digits",
-        400,
-      );
-    }
+  const cleanAccountNumber = String(accountNumber).replace(/\D/g, "");
 
-    // -----------------------------------------
-    // Check user
-    // -----------------------------------------
-    const user = await User.findById(userId);
-
-    if (!user) {
-      return responseHandler.errorResponse(res, "User not found", 404);
-    }
-
-    // -----------------------------------------
-    // Create Paystack transfer recipient
-    // -----------------------------------------
-    const recipientRes = await createTransferRecipient(
-      accountName,
-      cleanAccountNumber,
-      bankCode,
-    );
-
-    if (!recipientRes?.status || !recipientRes?.data?.recipient_code) {
-      return responseHandler.errorResponse(
-        res,
-        recipientRes?.message ||
-          "Failed to register bank recipient with Paystack",
-        400,
-      );
-    }
-
-    // -----------------------------------------
-    // Remove default from existing accounts
-    // -----------------------------------------
-    await BankAccount.updateMany(
-      {
-        userId,
-      },
-      {
-        $set: {
-          isDefault: false,
-        },
-      },
-    );
-
-    // -----------------------------------------
-    // Save bank account
-    // -----------------------------------------
-    const bankAccount = await BankAccount.create({
-      userId,
-      accountNumber: cleanAccountNumber,
-      accountName,
-      bankCode,
-      bankName,
-      recipientCode: recipientRes.data.recipient_code,
-      isDefault: true,
-    });
-
-    return responseHandler.successResponse(
-      res,
-      bankAccount,
-      "Bank account saved successfully",
-      201,
-    );
-  } catch (error) {
-    console.error("saveBankAccount error:", error);
-
-    return responseHandler.errorResponse(
-      res,
-      error.message || "Could not save bank account",
-      500,
-      error,
+  if (cleanAccountNumber.length !== 10) {
+    throw responseHandler.errorResponse(
+      "Account number must be 10 digits",
+      400,
     );
   }
-};
+
+  // -----------------------------------------
+  // Check user
+  // -----------------------------------------
+
+  const user = await User.findById(userId);
+
+  if (!user) {
+    throw responseHandler.errorResponse("User not found", 404);
+  }
+
+  // -----------------------------------------
+  // Create Paystack recipient
+  // -----------------------------------------
+
+  const recipientRes = await createTransferRecipient(
+    accountName,
+    cleanAccountNumber,
+    bankCode,
+  );
+
+  if (!recipientRes?.status || !recipientRes?.data?.recipient_code) {
+    throw responseHandler.errorResponse(
+      recipientRes?.message ||
+        "Failed to register bank recipient with Paystack",
+      400,
+    );
+  }
+
+  // -----------------------------------------
+  // Remove old default
+  // -----------------------------------------
+
+  await BankAccount.updateMany(
+    {
+      userId,
+    },
+    {
+      $set: {
+        isDefault: false,
+      },
+    },
+  );
+
+  // -----------------------------------------
+  // Save bank account
+  // -----------------------------------------
+
+  const bankAccount = await BankAccount.create({
+    userId,
+    accountNumber: cleanAccountNumber,
+    accountName,
+    bankCode,
+    bankName,
+    recipientCode: recipientRes.data.recipient_code,
+    isDefault: true,
+  });
+
+  // -----------------------------------------
+  // Notification
+  // -----------------------------------------
+
+  await notifyPaymentActivity({
+    userId,
+    title: "Bank Account Added",
+    message: `${bankName} account ending in ${cleanAccountNumber.slice(-4)} has been successfully added to your WAGBA account.`,
+    metadata: {
+      bankAccountId: bankAccount._id,
+      bankName,
+      accountName,
+      accountLast4: cleanAccountNumber.slice(-4),
+      action: "bank_account_added",
+    },
+  });
+
+  return responseHandler.successResponse(
+    res,
+    bankAccount,
+    "Bank account saved successfully",
+    201,
+  );
+});
 
 /**
  * ============================================================
  * 8. GET USER BANK ACCOUNTS
  * ============================================================
  */
-export const getUserBankAccounts = async (req, res) => {
-  try {
-    const { userId } = req.params;
 
-    if (!userId) {
-      return responseHandler.errorResponse(res, "User ID is required", 400);
-    }
+export const getUserBankAccounts = tryCatchFn(async (req, res) => {
+  const { userId } = req.params;
 
-    const bankAccounts = await BankAccount.find({
-      userId,
-    }).sort({
-      createdAt: -1,
-    });
-
-    return responseHandler.successResponse(
-      res,
-      bankAccounts,
-      "User bank accounts retrieved successfully",
-      200,
-    );
-  } catch (error) {
-    console.error("getUserBankAccounts error:", error);
-
-    return responseHandler.errorResponse(
-      res,
-      error.message || "Could not retrieve bank accounts",
-      500,
-      error,
-    );
+  if (!userId) {
+    throw responseHandler.errorResponse("User ID is required", 400);
   }
-};
+
+  const bankAccounts = await BankAccount.find({
+    userId,
+  }).sort({
+    createdAt: -1,
+  });
+
+  return responseHandler.successResponse(
+    res,
+    bankAccounts,
+    "User bank accounts retrieved successfully",
+    200,
+  );
+});
 
 /**
  * ============================================================
  * 9. WITHDRAW FUNDS
  * ============================================================
  */
+
 export const withdrawFunds = async (req, res) => {
   const session = await mongoose.startSession();
+
+  let transaction = null;
 
   try {
     session.startTransaction();
@@ -866,6 +961,10 @@ export const withdrawFunds = async (req, res) => {
     const PROCESSING_FEE = 50;
 
     const requestedAmount = Number(amount);
+
+    // -----------------------------------------
+    // Validate
+    // -----------------------------------------
 
     if (
       !userId ||
@@ -905,6 +1004,7 @@ export const withdrawFunds = async (req, res) => {
     // -----------------------------------------
     // Get wallet
     // -----------------------------------------
+
     const wallet = await UserWallet.findOne({
       userId,
     }).session(session);
@@ -928,6 +1028,7 @@ export const withdrawFunds = async (req, res) => {
     // -----------------------------------------
     // Get bank account
     // -----------------------------------------
+
     const bankAccount = await BankAccount.findOne({
       _id: bankAccountId,
       userId,
@@ -954,6 +1055,7 @@ export const withdrawFunds = async (req, res) => {
     // -----------------------------------------
     // Deduct wallet
     // -----------------------------------------
+
     wallet.balance -= requestedAmount;
 
     await wallet.save({
@@ -965,7 +1067,8 @@ export const withdrawFunds = async (req, res) => {
     // -----------------------------------------
     // Create pending transaction
     // -----------------------------------------
-    const [transaction] = await Transaction.create(
+
+    [transaction] = await Transaction.create(
       [
         {
           senderId: userId,
@@ -992,22 +1095,69 @@ export const withdrawFunds = async (req, res) => {
     // -----------------------------------------
     // Commit local DB changes
     // -----------------------------------------
+
     await session.commitTransaction();
 
     // -----------------------------------------
-    // Send money through Paystack
+    // Notify withdrawal started
     // -----------------------------------------
+
+    await notifyPaymentActivity({
+      userId,
+      title: "Withdrawal Processing",
+      message: `Your ₦${requestedAmount.toLocaleString()} withdrawal is being processed.`,
+      metadata: {
+        amount: requestedAmount,
+        fee: PROCESSING_FEE,
+        netPayout: netPayoutAmount,
+        reference,
+        transactionId: transaction._id,
+        paymentMethod: "bank_transfer",
+        paymentStatus: "pending",
+        bankName: bankAccount.bankName,
+        accountLast4: bankAccount.accountNumber.slice(-4),
+        action: "withdrawal_started",
+      },
+    });
+
+    // -----------------------------------------
+    // Paystack transfer
+    // -----------------------------------------
+
     try {
       const transferRes = await initiateTransfer(
         netPayoutAmount,
         bankAccount.recipientCode,
         reference,
-        "Wagba Wallet Withdrawal",
+        "WAGBA Wallet Withdrawal",
       );
 
       if (transferRes?.status === true) {
         await Transaction.findByIdAndUpdate(transaction._id, {
           status: "success",
+        });
+
+        // -------------------------------------
+        // Success notification
+        // -------------------------------------
+
+        await notifyPaymentActivity({
+          userId,
+          title: "Withdrawal Successful",
+          message: `Your withdrawal of ₦${requestedAmount.toLocaleString()} was processed successfully. ₦${netPayoutAmount.toLocaleString()} was sent to your bank account after the ₦${PROCESSING_FEE} processing fee.`,
+          metadata: {
+            amount: requestedAmount,
+            fee: PROCESSING_FEE,
+            netPayout: netPayoutAmount,
+            reference,
+            transactionId: transaction._id,
+            paymentMethod: "bank_transfer",
+            paymentStatus: "success",
+            newBalance: wallet.balance,
+            bankName: bankAccount.bankName,
+            accountLast4: bankAccount.accountNumber.slice(-4),
+            action: "withdrawal_success",
+          },
         });
 
         return responseHandler.successResponse(
@@ -1024,14 +1174,14 @@ export const withdrawFunds = async (req, res) => {
         );
       }
 
-      // Paystack returned unsuccessful response
       throw new Error(transferRes?.message || "Paystack transfer failed");
     } catch (paystackError) {
       console.error("Paystack withdrawal error:", paystackError);
 
-      // -----------------------------------------
-      // Restore wallet balance
-      // -----------------------------------------
+      // ---------------------------------------
+      // Restore wallet
+      // ---------------------------------------
+
       await UserWallet.findOneAndUpdate(
         {
           userId,
@@ -1043,12 +1193,34 @@ export const withdrawFunds = async (req, res) => {
         },
       );
 
-      // -----------------------------------------
+      // ---------------------------------------
       // Mark transaction failed
-      // -----------------------------------------
+      // ---------------------------------------
+
       await Transaction.findByIdAndUpdate(transaction._id, {
         status: "failed",
         "metadata.error": paystackError.message,
+      });
+
+      // ---------------------------------------
+      // Failure notification
+      // ---------------------------------------
+
+      await notifyPaymentActivity({
+        userId,
+        title: "Withdrawal Failed",
+        message: `Your ₦${requestedAmount.toLocaleString()} withdrawal could not be completed. The funds have been restored to your WAGBA wallet.`,
+        metadata: {
+          amount: requestedAmount,
+          fee: PROCESSING_FEE,
+          reference,
+          transactionId: transaction._id,
+          paymentMethod: "bank_transfer",
+          paymentStatus: "failed",
+          error: paystackError.message,
+          fundsRestored: true,
+          action: "withdrawal_failed",
+        },
       });
 
       return responseHandler.errorResponse(

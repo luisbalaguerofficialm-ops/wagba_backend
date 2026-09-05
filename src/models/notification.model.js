@@ -4,7 +4,6 @@ const NotificationSchema = new mongoose.Schema(
   {
     // ==========================================
     // PERSONAL NOTIFICATION OWNER
-    // Null when this is a broadcast notification
     // ==========================================
 
     user: {
@@ -31,12 +30,12 @@ const NotificationSchema = new mongoose.Schema(
     category: {
       type: String,
       enum: ["transaction", "security", "system", "activity", "orders"],
+      default: "system",
       index: true,
     },
 
     // ==========================================
     // TYPE
-    // Kept for backward compatibility
     // ==========================================
 
     type: {
@@ -47,9 +46,12 @@ const NotificationSchema = new mongoose.Schema(
         "transaction",
         "activity",
         "authentication",
-        "support",
         "order",
+        "payment",
+        "delivery",
+        "restaurant",
       ],
+      default: "system",
       index: true,
     },
 
@@ -61,6 +63,7 @@ const NotificationSchema = new mongoose.Schema(
       type: String,
       required: true,
       trim: true,
+      maxlength: 150,
       index: true,
     },
 
@@ -72,10 +75,11 @@ const NotificationSchema = new mongoose.Schema(
       type: String,
       required: true,
       trim: true,
+      maxlength: 1000,
     },
 
     // ==========================================
-    // PERSONAL NOTIFICATIONS ONLY
+    // PERSONAL NOTIFICATION READ STATUS
     // ==========================================
 
     read: {
@@ -85,7 +89,7 @@ const NotificationSchema = new mongoose.Schema(
     },
 
     // ==========================================
-    // BROADCAST NOTIFICATIONS ONLY
+    // BROADCAST READ USERS
     // ==========================================
 
     readBy: [
@@ -145,6 +149,7 @@ const NotificationSchema = new mongoose.Schema(
     sentToCount: {
       type: Number,
       default: 0,
+      min: 0,
     },
 
     // ==========================================
@@ -173,7 +178,16 @@ const NotificationSchema = new mongoose.Schema(
     },
 
     // ==========================================
-    // EXTRA METADATA
+    // EXTRA DATA
+    //
+    // Useful for:
+    // Order ID
+    // Payment reference
+    // Amount
+    // Payment method
+    // Transaction reference
+    // Restaurant ID
+    // Delivery information
     // ==========================================
 
     metadata: {
@@ -224,7 +238,13 @@ NotificationSchema.pre("save", function (next) {
   }
 
   if (!this.category && this.type) {
-    this.category = this.type;
+    if (["payment", "transaction"].includes(this.type)) {
+      this.category = "transaction";
+    } else if (["order", "delivery"].includes(this.type)) {
+      this.category = "orders";
+    } else {
+      this.category = "system";
+    }
   }
 
   next();
@@ -232,16 +252,10 @@ NotificationSchema.pre("save", function (next) {
 
 // ==========================================
 // MODEL
-// Prevent OverwriteModelError during
-// hot reload / development
 // ==========================================
 
 const Notification =
   mongoose.models.Notification ||
   mongoose.model("Notification", NotificationSchema);
-
-// ==========================================
-// EXPORT
-// ==========================================
 
 export default Notification;
