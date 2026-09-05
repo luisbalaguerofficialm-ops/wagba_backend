@@ -15,7 +15,7 @@ import {
   initiateTransfer,
 } from "../services/paystackservices.js";
 
-import { purchaseBitcoin } from "../services/bitcoinService.js";
+import { purchaseBitcoin } from "../services/bitcoinservice.js";
 
 import User from "../models/user.js";
 import UserWallet from "../models/userwallet.js";
